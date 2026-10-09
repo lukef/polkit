@@ -148,11 +148,8 @@ bsdauth_authenticate (const char *user_to_auth)
   fflush (stdout);
   usleep (10 * 1000); /* since fflush(3) seems buggy */
 
-  if (fgets (passwd, sizeof (passwd), stdin) == NULL)
+  if (read_line_from_agent (passwd, sizeof (passwd), -1, NULL) != 1)
     goto error;
-
-  if (strlen (passwd) > 0 && passwd[strlen (passwd) - 1] == '\n')
-    passwd[strlen (passwd) - 1] = '\0';
 
   if (auth_userokay((char *)user_to_auth, NULL, "auth-polkit", passwd) == 0)
     goto error;

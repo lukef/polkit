@@ -351,12 +351,8 @@ conversation_function (int n, const struct pam_message **msg, struct pam_respons
           send_to_helper ("PAM_PROMPT_ECHO_ON", msg[i]->msg);
 
         conv1:
-          if (fgets (buf, sizeof buf, stdin) == NULL)
+          if (read_line_from_agent (buf, sizeof buf, -1, NULL) != 1)
             goto error;
-
-          if (strlen (buf) > 0 &&
-              buf[strlen (buf) - 1] == '\n')
-            buf[strlen (buf) - 1] = '\0';
 
           aresp[i].resp = strdup (buf);
           if (aresp[i].resp == NULL)
