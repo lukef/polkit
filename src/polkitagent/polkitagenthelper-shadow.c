@@ -181,11 +181,8 @@ shadow_authenticate (struct spwd *shadow)
   fflush (stdout);
   usleep (10 * 1000); /* since fflush(3) seems buggy */
 
-  if (fgets (passwd, sizeof (passwd), stdin) == NULL)
+  if (read_line_from_agent (passwd, sizeof (passwd), -1, NULL) != 1)
     goto error;
-
-  if (strlen (passwd) > 0 && passwd[strlen (passwd) - 1] == '\n')
-    passwd[strlen (passwd) - 1] = '\0';
 
   /* Use the encrypted password as the salt, according to the crypt(3) man page,
    * it will perform whatever encryption method is specified in /etc/shadow
