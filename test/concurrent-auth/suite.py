@@ -423,10 +423,11 @@ def c7_concurrent_stack_that_prompts():
 
 
 @case
-def c8_win_refuses_later_prompts():
-    # The first password module shrugs off a conversation error; the second
-    # (the test module) then asks. After a win that question must be refused
-    # by the helper, not shown to the agent, and the request must succeed.
+def c8_win_ends_the_password_stack():
+    # The first password module would shrug off a conversation error, and the
+    # second (the test module) would then ask. After a win the password stack
+    # goes no further: that module never runs, so its question never reaches
+    # the agent, and the request succeeds.
     stack, trace = finger("c8", 1, 0)
     pw_stack, pw_trace = finger("c8pw", 0, 0, prompt=True)
     configure("auth [default=ignore] pam_unix.so\n" + pw_stack.split("\n")[0] + "\naccount required pam_unix.so\n",
@@ -436,8 +437,7 @@ def c8_win_refuses_later_prompts():
         pt = read_trace(pw_trace)
         check("c8", r["ok"], f"authenticated by finger ({r['elapsed']:.2f}s)")
         check("c8", len(r["prompts"]) == 1, f"no second prompt reached the agent ({len(r['prompts'])})")
-        check("c8", any(l.startswith("prompt rc=") and l != "prompt rc=0" for l in pt),
-              f"the later prompt was refused by the helper: {[l for l in pt if 'prompt' in l][:1]}")
+        check("c8", not starts(pt), f"the later module never ran: {pt[:1]}")
         check("c8", r["elapsed"] < 1.6, "no failure delay")
 
 
@@ -582,6 +582,35 @@ def c19_agent_hangs_up_mid_race():
     r = run_helper([(1.0, ("signal", signal.SIGHUP))], timeout=10)
     if common("c19", r):
         check("c19", not leftover_pids(read_trace(trace)), "concurrent child and grandchild killed")
+
+
+
+
+@case
+def c20_win_never_reaches_the_failure_path():
+    # The shape most distributions ship: polkit-1 includes a shared stack where
+    # pam_faillock's authfail sits on pam_unix's failure path. A finger win
+    # abandons the password prompt; that must not run the failure path, or
+    # every fingerprint approval counts as a wrong password towards a lockout.
+    # The "counter" is the test module standing where authfail would.
+    stack, trace = finger("c20", 1, 0)
+    counter, counter_trace = finger("c20fail", 0, 1)
+    counter_module = counter.split("\n")[0].split(" ", 2)[2]
+    password_stack = ("auth [success=1 default=bad] pam_unix.so\n"
+                      f"auth [default=die] {counter_module}\n"
+                      "auth required pam_permit.so\n"
+                      "account required pam_unix.so\n")
+    configure(password_stack, concurrent=stack)
+    r = run_helper([])
+    if common("c20", r):
+        check("c20", r["ok"], f"authenticated by finger ({r['elapsed']:.2f}s)")
+        check("c20", not starts(read_trace(counter_trace)), "the failure path never ran")
+    # A real wrong password still reaches it.
+    configure(password_stack, concurrent=finger("c20slow", 30, 0)[0])
+    r = run_helper([(0.3, "wrong\n")], timeout=15)
+    if common("c20", r):
+        check("c20", r["ok"] is False and starts(read_trace(counter_trace)),
+              "a wrong password still runs the failure path")
 
 
 for fn in CASES:
