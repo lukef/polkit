@@ -65,6 +65,19 @@
  */
 #define PAM_SERVICE_NAME_CONCURRENT "polkit-1-concurrent"
 
+/* What the concurrent stack promises the PAM configuration around it, for
+ * installers that write that configuration and can only read the binary
+ * (strings(1) finds it). Raised whenever the promise changes:
+ *
+ *   1  a win returns a failed conversation to the password stack, which takes
+ *      its failure path (pam_faillock's authfail counts it)
+ *   2  a win ends the request in the conversation; nothing after the
+ *      abandoned prompt runs
+ *
+ * A helper without the marker that supports PAM_SERVICE_NAME_CONCURRENT is 1.
+ */
+static const char concurrent_contract[] __attribute__ ((used)) = "polkit-1-concurrent-contract=2";
+
 /* Linux-PAM reads both, preferring /etc. */
 static const char *pam_service_directories[] = { "/etc/pam.d", "/usr/lib/pam.d" };
 
