@@ -71,11 +71,17 @@ static const char *pam_service_directories[] = { "/etc/pam.d", "/usr/lib/pam.d" 
 /* Single byte written back by the concurrent child to report its verdict. */
 #define CONCURRENT_VERDICT_SUCCESS 'y'
 
-/* Lets the conversation stop waiting for the agent once the concurrent stack wins. */
+/* The request, as far as the conversation needs it: enough to watch the
+ * concurrent stack's verdict, and to end the request itself when it wins.
+ */
 typedef struct
 {
   int verdict_fd;             /* read end of the child's pipe, -1 once done */
-  gboolean concurrent_won;
+  pid_t concurrent_child;     /* -1 once stopped */
+  const char *cookie;
+  const char *user_to_auth;
+  int pidfd;
+  int uid;
 } ConversationData;
 
 /* The concurrent child's process group while the race runs, else 0. */
@@ -127,32 +133,6 @@ send_to_helper (const gchar *str1,
   g_free (tmp2);
 }
 
-/* A won race fails the password stack on purpose, and libpam would then sleep
- * out the delay a module requested as if a password had been wrong. Skip it
- * for that case only; real failures sleep exactly what libpam would have.
- *
- * PAM_FAIL_DELAY is Linux-PAM's; OpenPAM imposes no delay of its own.
- */
-#ifdef PAM_FAIL_DELAY
-static void
-fail_delay (int retval, unsigned usec, void *appdata)
-{
-  ConversationData *conversation_data = appdata;
-  struct timespec remaining;
-
-  if (conversation_data != NULL && conversation_data->concurrent_won)
-    return;
-
-  if (retval == PAM_SUCCESS || usec == 0)
-    return;
-
-  remaining.tv_sec = usec / 1000000;
-  remaining.tv_nsec = (long) (usec % 1000000) * 1000;
-  while (nanosleep (&remaining, &remaining) != 0 && errno == EINTR)
-    ;
-}
-#endif /* PAM_FAIL_DELAY */
-
 /* Authenticates @user_to_auth, checks the account unless @authenticate_only,
  * and confirms PAM authenticated that user. Both stacks go through here.
  */
@@ -181,15 +161,6 @@ authenticate_with_pam (const char *service,
       goto out;
     }
 
-#ifdef PAM_FAIL_DELAY
-  /* See fail_delay. */
-  rc = pam_set_item (pam_h, PAM_FAIL_DELAY, (const void *) fail_delay);
-  if (rc != PAM_SUCCESS)
-    {
-      fprintf (stderr, "polkit-agent-helper-1: pam_set_item failed: %s\n", pam_strerror (pam_h, rc));
-      goto out;
-    }
-#endif
 
   /* is user really user? */
   rc = pam_authenticate (pam_h, 0);
@@ -552,6 +523,56 @@ stop_concurrent_authentication (pid_t child,
     ;
 }
 
+/* Ends the request: stops the race, tells polkitd about an authenticated
+ * user, and tells the agent how it went. Returns the exit status.
+ */
+static int
+complete_request (ConversationData *request,
+                  gboolean authenticated)
+{
+  stop_concurrent_authentication (request->concurrent_child, request->verdict_fd);
+  request->concurrent_child = -1;
+  request->verdict_fd = -1;
+
+  if (!authenticated)
+    {
+      fprintf (stdout, "FAILURE\n");
+      flush_and_wait ();
+      /* if run via systemd socket, failed authentication won't taint the system using SuccessExitStatus=2*/
+      return 2;
+    }
+
+#ifdef PAH_DEBUG
+  fprintf (stderr, "polkit-agent-helper-1: successfully authenticated user '%s'.\n", request->user_to_auth);
+#endif /* PAH_DEBUG */
+
+#ifdef PAH_DEBUG
+  fprintf (stderr, "polkit-agent-helper-1: sending D-Bus message to PolicyKit daemon\n");
+#endif /* PAH_DEBUG */
+
+  /* now send a D-Bus message to the PolicyKit daemon that
+   * includes a) the cookie; b) the user we authenticated;
+   * c) the pidfd and uid of the caller, if socket-activated
+   */
+  if (!send_dbus_message (request->cookie, request->user_to_auth, request->pidfd, request->uid))
+    {
+#ifdef PAH_DEBUG
+      fprintf (stderr, "polkit-agent-helper-1: error sending D-Bus message to PolicyKit daemon\n");
+#endif /* PAH_DEBUG */
+      fprintf (stdout, "FAILURE\n");
+      flush_and_wait ();
+      return 1;
+    }
+
+#ifdef PAH_DEBUG
+  fprintf (stderr, "polkit-agent-helper-1: successfully sent D-Bus message to PolicyKit daemon\n");
+#endif /* PAH_DEBUG */
+
+  fprintf (stdout, "SUCCESS\n");
+  flush_and_wait ();
+  return 0;
+}
+
 static gboolean
 reset_signal_state (void)
 {
@@ -587,8 +608,7 @@ main (int argc, char *argv[])
   char *user_to_auth_free = NULL;
   char *cookie = NULL;
   struct pam_conv pam_conversation;
-  ConversationData conversation_data = { -1, FALSE };
-  pid_t concurrent_child = -1;
+  ConversationData conversation_data = { -1, -1, NULL, NULL, -1, -1 };
 
   rc = 0;
 
@@ -717,63 +737,32 @@ main (int argc, char *argv[])
 
   pam_conversation.conv        = conversation_function;
   pam_conversation.appdata_ptr = &conversation_data;
+  conversation_data.cookie = cookie;
+  conversation_data.user_to_auth = user_to_auth;
+  conversation_data.pidfd = pidfd;
+  conversation_data.uid = uid;
 
   /* PAM conversations are serial, so a factor that needs no input runs as a
-   * second stack beside the one that talks to the agent.
+   * second stack beside the one that talks to the agent. If it wins, the
+   * request ends inside the conversation and this call does not return.
    */
-  conversation_data.verdict_fd = start_concurrent_authentication (user_to_auth, &concurrent_child);
+  conversation_data.verdict_fd = start_concurrent_authentication (user_to_auth, &conversation_data.concurrent_child);
 
-  if (!authenticate_with_pam (PAM_SERVICE_NAME, user_to_auth, &pam_conversation, FALSE) &&
-      !(conversation_data.concurrent_won && run_concurrent_account_check (user_to_auth)))
-    {
-      /* if run via systemd socket, failed authentication won't taint the system using SuccessExitStatus=2*/
-      errval = 2;
-      goto error;
-    }
-
-  stop_concurrent_authentication (concurrent_child, conversation_data.verdict_fd);
-  concurrent_child = -1;
-  conversation_data.verdict_fd = -1;
-
-#ifdef PAH_DEBUG
-  fprintf (stderr, "polkit-agent-helper-1: successfully authenticated user '%s'.\n", user_to_auth);
-#endif /* PAH_DEBUG */
-
-#ifdef PAH_DEBUG
-  fprintf (stderr, "polkit-agent-helper-1: sending D-Bus message to PolicyKit daemon\n");
-#endif /* PAH_DEBUG */
-
-  /* now send a D-Bus message to the PolicyKit daemon that
-   * includes a) the cookie; b) the user we authenticated;
-   * c) the pidfd and uid of the caller, if socket-activated
-   */
-  if (!send_dbus_message (cookie, user_to_auth, pidfd, uid))
-    {
-#ifdef PAH_DEBUG
-      fprintf (stderr, "polkit-agent-helper-1: error sending D-Bus message to PolicyKit daemon\n");
-#endif /* PAH_DEBUG */
-      goto error;
-    }
+  rc = complete_request (&conversation_data,
+                         authenticate_with_pam (PAM_SERVICE_NAME, user_to_auth, &pam_conversation, FALSE));
 
   free (cookie);
   free (user_to_auth_free);
   if (pidfd >= 0)
     close (pidfd);
-
-#ifdef PAH_DEBUG
-  fprintf (stderr, "polkit-agent-helper-1: successfully sent D-Bus message to PolicyKit daemon\n");
-#endif /* PAH_DEBUG */
-
-  fprintf (stdout, "SUCCESS\n");
-  flush_and_wait();
-  return 0;
+  return rc;
 
 error:
   free (cookie);
   free (user_to_auth_free);
   if (pidfd >= 0)
     close (pidfd);
-  stop_concurrent_authentication (concurrent_child, conversation_data.verdict_fd);
+  stop_concurrent_authentication (conversation_data.concurrent_child, conversation_data.verdict_fd);
 
   fprintf (stdout, "FAILURE\n");
   flush_and_wait();
@@ -786,15 +775,9 @@ conversation_function (int n, const struct pam_message **msg, struct pam_respons
   struct pam_response *aresp;
   char buf[PAM_MAX_RESP_SIZE];
   int i;
+  gboolean concurrent_won = FALSE;
 
   ConversationData *conversation_data = data;
-
-  /* The concurrent stack has won. A module that shrugs off the aborted prompt
-   * would pass the stack to the next one, which would ask the agent for a
-   * password nobody will give; refuse every further prompt instead.
-   */
-  if (conversation_data != NULL && conversation_data->concurrent_won)
-    return PAM_CONV_ERR;
 
   if (n <= 0 || n > PAM_MAX_NUM_MSG)
     return PAM_CONV_ERR;
@@ -841,7 +824,7 @@ conversation_function (int n, const struct pam_message **msg, struct pam_respons
                */
               if (read (verdict_fd, &verdict, 1) == 1 && verdict == CONCURRENT_VERDICT_SUCCESS)
                 {
-                  conversation_data->concurrent_won = TRUE;
+                  concurrent_won = TRUE;
                   goto error;
                 }
 
@@ -888,6 +871,19 @@ error:
   memset (aresp, 0, n * sizeof *aresp);
   free (aresp);
   *resp = NULL;
+
+  /* The concurrent stack won, and the request ends here rather than back in
+   * the password stack. Returning would fail this prompt, and the stack would
+   * take its failure path -- which, behind the shared stack most distributions
+   * include, is pam_faillock's authfail: every concurrent win would count as a
+   * wrong password towards a lockout. Ending here leaves the rest of the
+   * password stack unrun, as a helper the agent stopped would; nothing in it
+   * is left half-written, because the stack is waiting on this prompt.
+   */
+  if (concurrent_won)
+    _exit (complete_request (conversation_data,
+                             run_concurrent_account_check (conversation_data->user_to_auth)));
+
   return PAM_CONV_ERR;
 }
 
